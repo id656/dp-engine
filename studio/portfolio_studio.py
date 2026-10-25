@@ -383,9 +383,29 @@ def _is_claude_code(exe):
         return False
 
 
+def refresh_path():
+    """Ярлык из Проводника получает PATH на момент входа в Windows. Перечитываем актуальный из реестра."""
+    if os.name != 'nt':
+        return
+    import winreg
+    parts = []
+    for hive, key in ((winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Control\Session Manager\Environment'),
+                      (winreg.HKEY_CURRENT_USER, 'Environment')):
+        try:
+            with winreg.OpenKey(hive, key) as k:
+                parts.append(os.path.expandvars(winreg.QueryValueEx(k, 'Path')[0]))
+        except OSError:
+            pass
+    extra = [os.path.join(os.path.expanduser('~'), '.local', 'bin'), os.path.join(os.environ.get('APPDATA', ''), 'npm')]
+    cur = os.environ.get('PATH', '').split(os.pathsep)
+    new = [x for x in os.pathsep.join(parts + extra).split(os.pathsep) if x]
+    os.environ['PATH'] = os.pathsep.join(dict.fromkeys(new + cur))
+
+
 def find_claude():
     """Ищет уже установленный Claude Code: PATH, установщик, npm, встроенный в приложение Claude."""
     import glob
+    refresh_path()
     w = shutil.which('claude')
     if w:
         return w
@@ -393,15 +413,17 @@ def find_claude():
         return None
     H, A, L = os.path.expanduser('~'), os.environ.get('APPDATA', ''), os.environ.get('LOCALAPPDATA', '')
     direct = [os.path.join(H, '.local', 'bin', 'claude.exe'), os.path.join(A, 'npm', 'claude.cmd'),
-              os.path.join(L, 'Programs', 'claude', 'claude.exe')]
+              os.path.join(L, 'Programs', 'claude', 'claude.exe'),
+              os.path.join(L, 'Microsoft', 'WinGet', 'Links', 'claude.exe'),
+              os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'nodejs', 'claude.cmd')]
     for c in direct:
         if os.path.exists(c):
             return c
     found = []
     for root in (os.path.join(A, 'Claude'), os.path.join(L, 'Claude'), os.path.join(L, 'AnthropicClaude'),
-                 os.path.join(L, 'Claude-Data'), os.path.join(L, 'Programs')):
-        for pat in ('*claude*code*/**/claude.exe', '**/claude-code/**/claude.exe', '**/bin/claude.exe'):
-            found += glob.glob(os.path.join(root, pat), recursive=True)
+                 os.path.join(L, 'Claude-Data'), os.path.join(L, 'Claude-3p'), os.path.join(L, 'Programs'),
+                 os.path.join(L, 'Microsoft', 'WinGet', 'Packages')):
+        found += glob.glob(os.path.join(root, '**', 'claude.exe'), recursive=True)
     # приложение Claude (Claude.exe в app-*/корне) — не CLI; проверяем кандидатов запуском --version
     found = sorted({f for f in found if not os.path.basename(os.path.dirname(f)).lower().startswith('app-')},
                    key=os.path.getmtime, reverse=True)
@@ -412,6 +434,7 @@ def find_claude():
 
 
 def resolve_claude(s):
+    refresh_path()
     exe = shutil.which(s.get('claude_exe') or 'claude') or (s.get('claude_exe') if os.path.exists(s.get('claude_exe') or '') else None)
     if not exe:
         exe = find_claude()
@@ -441,7 +464,52 @@ def check_env(s):
 
 
 # ---------------------------------------------------------------- интерфейс
+def write_diag():
+    """Журнал окружения: %LOCALAPPDATA%\\PortfolioStudio\\diag.txt (для поддержки)."""
+    import glob, platform
+    L = []
+    try:
+        L.append(f'{APP_NAME} {APP_VER} · {sys.executable} · {platform.platform()}')
+        for c in ('claude', 'git', 'node', 'python', 'pythonw'):
+            L.append(f'which {c}: {shutil.which(c)}')
+        H, A, LA = os.path.expanduser('~'), os.environ.get('APPDATA', ''), os.environ.get('LOCALAPPDATA', '')
+        pats = [H + r'\.local\bin\claude*', A + r'\npm\claude*', A + r'\Claude\**\claude*.exe',
+                LA + r'\Claude*\**\claude*.exe', LA + r'\AnthropicClaude\**\claude*.exe',
+                LA + r'\Programs\**\claude*.exe', LA + r'\Packages\*Claude*\**\claude*.exe']
+        seen = set()
+        for pt in pats:
+            for f in glob.glob(pt, recursive=True):
+                if f in seen:
+                    continue
+                seen.add(f)
+                try:
+                    v = subprocess.run([f, '--version'], capture_output=True, text=True, timeout=20,
+                                       stdin=subprocess.DEVNULL,
+                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                    L.append(f'cand {f} => {(v.stdout + v.stderr).strip()[:150]}')
+                except Exception as e:  # noqa: BLE001
+                    L.append(f'cand {f} ERR {e}')
+        L.append('find_claude: ' + str(find_claude()))
+        for m in ('reportlab', 'numpy', 'scipy', 'PIL', 'pypdf', 'pdfplumber', 'ifcopenshell'):
+            try:
+                __import__(m)
+                L.append('mod ok ' + m)
+            except Exception as e:  # noqa: BLE001
+                L.append(f'mod MISSING {m}: {e}')
+        L.append('PATH=' + os.environ.get('PATH', ''))
+    except Exception as e:  # noqa: BLE001
+        L.append('diag ERR ' + repr(e))
+    try:
+        d = os.path.join(os.environ.get('LOCALAPPDATA', data_dir()), 'PortfolioStudio')
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'diag.txt'), 'w', encoding='utf-8') as f:
+            f.write('\n'.join(L))
+    except OSError:
+        pass
+
+
 def run_gui():
+    threading.Thread(target=write_diag, daemon=True).start()
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
 
