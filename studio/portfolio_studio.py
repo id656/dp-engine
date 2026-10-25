@@ -349,8 +349,12 @@ def update_engine(s):
         return 'движок: локальная копия'
     fl = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     try:
-        r = subprocess.run(['git', '-C', root, 'pull', '--ff-only', '-q'], capture_output=True, text=True,
-                           timeout=120, creationflags=fl)
+        pull = ['git', '-C', root, 'pull', '--ff-only', '-q']
+        r = subprocess.run(pull, capture_output=True, text=True, timeout=120, creationflags=fl)
+        if r.returncode != 0:      # локальные правки мешают — убрать их в stash (не удаляются) и повторить
+            subprocess.run(['git', '-C', root, 'stash', 'push', '-u', '-q', '-m', 'portfolio-studio auto'],
+                           capture_output=True, timeout=60, creationflags=fl)
+            r = subprocess.run(pull, capture_output=True, text=True, timeout=120, creationflags=fl)
         h = subprocess.run(['git', '-C', root, 'log', '-1', '--format=%h · %cd', '--date=format:%d.%m.%Y'],
                            capture_output=True, text=True, timeout=20, creationflags=fl).stdout.strip()
         return ('движок ' + h) if r.returncode == 0 else ('движок ' + h + ' · не обновился')
@@ -369,12 +373,60 @@ def load_fonts():
             ctypes.windll.gdi32.AddFontResourceExW(os.path.join(d, f), 0x10, 0)
 
 
+# ---------------------------------------------------------------- поиск Claude Code
+def _is_claude_code(exe):
+    try:
+        v = subprocess.run([exe, '--version'], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        return 'claude code' in (v.stdout + v.stderr).lower()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def find_claude():
+    """Ищет уже установленный Claude Code: PATH, установщик, npm, встроенный в приложение Claude."""
+    import glob
+    w = shutil.which('claude')
+    if w:
+        return w
+    if os.name != 'nt':
+        return None
+    H, A, L = os.path.expanduser('~'), os.environ.get('APPDATA', ''), os.environ.get('LOCALAPPDATA', '')
+    direct = [os.path.join(H, '.local', 'bin', 'claude.exe'), os.path.join(A, 'npm', 'claude.cmd'),
+              os.path.join(L, 'Programs', 'claude', 'claude.exe')]
+    for c in direct:
+        if os.path.exists(c):
+            return c
+    found = []
+    for root in (os.path.join(A, 'Claude'), os.path.join(L, 'Claude'), os.path.join(L, 'AnthropicClaude'),
+                 os.path.join(L, 'Claude-Data'), os.path.join(L, 'Programs')):
+        for pat in ('*claude*code*/**/claude.exe', '**/claude-code/**/claude.exe', '**/bin/claude.exe'):
+            found += glob.glob(os.path.join(root, pat), recursive=True)
+    # приложение Claude (Claude.exe в app-*/корне) — не CLI; проверяем кандидатов запуском --version
+    found = sorted({f for f in found if not os.path.basename(os.path.dirname(f)).lower().startswith('app-')},
+                   key=os.path.getmtime, reverse=True)
+    for f in found[:6]:
+        if _is_claude_code(f):
+            return f
+    return None
+
+
+def resolve_claude(s):
+    exe = shutil.which(s.get('claude_exe') or 'claude') or (s.get('claude_exe') if os.path.exists(s.get('claude_exe') or '') else None)
+    if not exe:
+        exe = find_claude()
+        if exe:
+            s['claude_exe'] = exe
+            save_settings(s)
+    return exe
+
+
 # ---------------------------------------------------------------- проверка окружения
 def check_env(s):
     msgs = []
-    exe = shutil.which(s['claude_exe'])
+    exe = resolve_claude(s)
     if not exe:
-        msgs.append('✗ Claude Code не найден. Запустите install.bat или укажите путь к claude.exe в настройках.')
+        msgs.append('✗ Claude Code не найден. Укажите путь к claude.exe в «Настройках».')
     else:
         try:
             v = subprocess.run([exe, '--version'], capture_output=True, text=True, timeout=30,
@@ -765,10 +817,13 @@ def run_gui():
     except OSError:
         pass
 
-    if not shutil.which(s['claude_exe']):
-        root.after(600, lambda: messagebox.showwarning(
-            APP_NAME, 'Claude Code не найден.\nЗапустите install.bat (установит Claude Code и движок) '
-                      'и войдите своей учётной записью Claude.'))
+    def _find():
+        exe = resolve_claude(s)
+        if not exe:
+            root.after(0, lambda: messagebox.showwarning(
+                APP_NAME, 'Claude Code не найден автоматически.\n\nОткройте «Настройки» и укажите путь к claude.exe '
+                          '(или claude.cmd). Узнать путь: в командной строке выполните  where claude'))
+    threading.Thread(target=_find, daemon=True).start()
     poll()
     root.mainloop()
 
